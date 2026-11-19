@@ -8,7 +8,8 @@ from custom_parser import (
     find_system_log_file,
     record_conclusion,
 )
-from github_api import create_github_api_client, list_all_jobs_for_workflow_run
+from github_api import call_with_retries, create_github_api_client, list_all_jobs_for_workflow_run
+import io
 import json
 import logging
 import os
@@ -81,7 +82,7 @@ api = create_github_api_client(
 
 # Github API calls
 get_workflow_run_by_run_id = do_fastcore_decode(
-    api.actions.get_workflow_run(GHA_RUN_ID)
+    call_with_retries(api.actions.get_workflow_run, GHA_RUN_ID)
 )
 # All jobs, across pages: one page holds at most 100, and big runs have more.
 workflow_run_jobs = list_all_jobs_for_workflow_run(api, GHA_RUN_ID, do_fastcore_decode)
@@ -150,55 +151,64 @@ p_parent = tracer.start_span(
 )
 record_conclusion(p_parent, workflow_run_atts.get("conclusion"))
 
-# Download logs
-# Have to use python requests due to known issue with ghapi -> https://github.com/fastai/ghapi/issues/119
-bearer = "Bearer " + GHA_TOKEN
-req_headers = {
-    "Accept": "application/vnd.github+json",
-    "Authorization": "Bearer " + GHA_TOKEN,
-    "X-GitHub-Api-Version": "2022-11-28",
-}
+# Download logs, only when they are exported. On big runs GitHub often cuts the
+# archive stream, and a failed download must not lose the traces.
+LOGS_AVAILABLE = False
+if not GHA_EXPORT_LOGS:
+    print("INFO: GHA_EXPORT_LOGS is false; skipping the run log download")
+else:
+    # Have to use python requests due to known issue with ghapi -> https://github.com/fastai/ghapi/issues/119
+    req_headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + GHA_TOKEN,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
-url1 = (
-    GITHUB_API_URL
-    + "/repos/"
-    + GHA_SERVICE_NAME.split("/")[0]
-    + "/"
-    + GHA_SERVICE_NAME.split("/")[1]
-    + "/actions/runs/"
-    + str(GHA_RUN_ID)
-    + "/logs"
-)
-log_session = requests.Session()
-log_session.mount(
-    "https://",
-    HTTPAdapter(
-        max_retries=Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[502, 503, 504],
-            allowed_methods=["GET"],
-        )
-    ),
-)
-log_download_attempts = 3
-for attempt in range(1, log_download_attempts + 1):
-    try:
-        r1 = log_session.get(url1, headers=req_headers, timeout=30)
-        r1.raise_for_status()
-        log_content = r1.content
-        break
-    except (requests.exceptions.ChunkedEncodingError, requests.exceptions.RequestException) as e:
-        print(f"WARN: Attempt {attempt}/{log_download_attempts} to download logs for run {GHA_RUN_ID} from {url1} failed: {e}")
-        if attempt == log_download_attempts:
-            print(f"ERROR: Giving up downloading logs for run {GHA_RUN_ID} after {log_download_attempts} attempts")
-            raise
-        time.sleep(2 ** attempt)
-with open("log.zip", "wb") as output_file:
-    output_file.write(log_content)
-
-with zipfile.ZipFile("log.zip", "r") as zip_ref:
-    zip_ref.extractall("./logs")
+    url1 = (
+        GITHUB_API_URL
+        + "/repos/"
+        + GHA_SERVICE_NAME.split("/")[0]
+        + "/"
+        + GHA_SERVICE_NAME.split("/")[1]
+        + "/actions/runs/"
+        + str(GHA_RUN_ID)
+        + "/logs"
+    )
+    log_session = requests.Session()
+    log_session.mount(
+        "https://",
+        HTTPAdapter(
+            max_retries=Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[502, 503, 504],
+                allowed_methods=["GET"],
+            )
+        ),
+    )
+    log_download_attempts = 3
+    log_content = None
+    for attempt in range(1, log_download_attempts + 1):
+        try:
+            r1 = log_session.get(url1, headers=req_headers, timeout=30)
+            r1.raise_for_status()
+            log_content = r1.content
+            break
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.RequestException) as e:
+            print(f"WARN: Attempt {attempt}/{log_download_attempts} to download logs for run {GHA_RUN_ID} from {url1} failed: {e}")
+            if attempt < log_download_attempts:
+                time.sleep(2 ** attempt)
+    if log_content is None:
+        print(f"WARN: Could not download logs for run {GHA_RUN_ID} after {log_download_attempts} attempts; exporting traces without logs")
+    else:
+        try:
+            with open("log.zip", "wb") as output_file:
+                output_file.write(log_content)
+            with zipfile.ZipFile("log.zip", "r") as zip_ref:
+                zip_ref.extractall("./logs")
+            LOGS_AVAILABLE = True
+        except (OSError, zipfile.BadZipFile) as e:
+            print(f"WARN: Could not extract logs for run {GHA_RUN_ID} ({e}); exporting traces without logs")
 
 # Jobs trace span
 # Set Jobs tracer and logger
@@ -292,9 +302,16 @@ for job in job_lst:
                 record_conclusion(child_1, step.get("conclusion"))
                 with trace.use_span(child_1, end_on_exit=False):
                     # Parse logs
-                    log_path = find_log_file("./logs", job["name"], step["number"], step["name"])
+                    log_path = (
+                        find_log_file("./logs", job["name"], step["number"], step["name"])
+                        if LOGS_AVAILABLE
+                        else None
+                    )
                     try:
-                        with open(log_path) as f:
+                        if log_path is None and LOGS_AVAILABLE:
+                            raise FileNotFoundError("no log file for this step")
+                        # No logs downloaded: read nothing, but still end and export the step span.
+                        with (open(log_path) if log_path else io.StringIO("")) as f:
                             for line in f.readlines():
                                 try:
                                     # Remove BOM and leading whitespace
@@ -428,7 +445,7 @@ for job in job_lst:
 
         child_0.end(end_time=do_time(job["completed_at"]))
         # Process system.txt for the job if it exists
-        system_log_path = find_system_log_file("./logs", job["name"])
+        system_log_path = find_system_log_file("./logs", job["name"]) if LOGS_AVAILABLE else None
         if system_log_path and os.path.exists(system_log_path):
             try:
                 with open(system_log_path) as syslog:
